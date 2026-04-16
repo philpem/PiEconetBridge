@@ -726,6 +726,18 @@ irqreturn_t econet_irq(int irq, void *ident)
 	}
 
 	/*
+	 * Sync fast_rx_enabled with the current chipstate.
+	 * Only EM_READ should allow the top half to fast-path FIFO
+	 * reads — any other state means we're between frames, in a
+	 * TX phase, or recovering from an error, and the top half
+	 * must wake the thread for proper state-machine handling.
+	 */
+	if (econet_get_chipstate() == EM_READ)
+		atomic_set(&econet_data->fast_rx_enabled, 1);
+	else
+		atomic_set(&econet_data->fast_rx_enabled, 0);
+
+	/*
 	 * Unlock IRQ spinlock prior to return.
 	 *
 	 */
