@@ -398,13 +398,50 @@ inline void econet_irq_write_new (u8 i_sr1, u8 i_sr2)
 
 /* econet_irq_hardirq()
  *
- * Minimal hard-IRQ top half — just wakes the threaded handler.
- * With IRQF_ONESHOT the GIC keeps the line masked until the
- * thread function returns, preventing re-entry.
+ * Hard-IRQ top half with fast-path FIFO drain.
+ *
+ * When the thread has set fast_rx_enabled (we're in EM_READ and
+ * receiving frame data), the top half reads FIFO bytes directly —
+ * this runs in ~2-4µs vs. the ~50+µs thread scheduling latency
+ * that was causing RX overruns.
+ *
+ * For anything other than a plain data byte (frame valid, errors,
+ * TX, state transitions), we snapshot the SR values and wake the
+ * thread for full state-machine processing.
+ *
+ * IRQF_ONESHOT guarantees the top half and thread never run
+ * concurrently for this IRQ line, so no lock is needed for rxp
+ * or the shadow SR fields.
  */
 
 irqreturn_t econet_irq_hardirq(int irq, void *ident)
 {
+	u8 hsr1, hsr2;
+
+	/* Fast path: if the thread told us we're mid-frame RX,
+	 * try to grab the data byte without waking the thread. */
+	if (atomic_read(&econet_data->fast_rx_enabled))
+	{
+		hsr1 = econet_read_sr(1);
+		hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
+
+		/* Pure data byte: RDA set, no frame-end or error flags */
+		if ((hsr1 & ECONET_GPIO_S1_RDA)
+		    && !(hsr2 & (ECONET_GPIO_S2_VALID | ECONET_GPIO_S2_ERR
+		               | ECONET_GPIO_S2_OVERRUN | ECONET_GPIO_S2_DCD
+		               | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT))
+		    && econet_data->rxp
+		    && econet_data->rxp->ptr < ECONET_MAX_PACKET_SIZE)
+		{
+			econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
+			return IRQ_HANDLED; /* line unmasked, thread not woken */
+		}
+
+		/* Not a simple data byte — fall through to wake thread */
+		econet_data->shadow_sr1 = hsr1;
+		econet_data->shadow_sr2 = hsr2;
+	}
+
 	return IRQ_WAKE_THREAD;
 }
 
@@ -418,21 +455,32 @@ irqreturn_t econet_irq(int irq, void *ident)
 
 	u8		chip_state, handled = 0;
 
+	/* Disable fast-path FIFO reads while the thread runs.
+	 * IRQF_ONESHOT keeps the line masked so this is safe. */
+	atomic_set(&econet_data->fast_rx_enabled, 0);
+
 	/* Serialise against econet_writefd */
 
 	spin_lock(&econet_irq_spin);
 
-	/* Read SR1 only, for speed. SR2 read below if need be */
-
-	sr1 = econet_read_sr(1);
-
-	sr2 = (sr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
-
-	if (!(sr1 & ECONET_GPIO_S1_IRQ)) /* Read it again in case we've read it too quickly! */
+	/* Use SR values snapshot by the top half if available,
+	 * otherwise re-read (e.g. first IRQ before fast_rx is set). */
+	if (econet_data->shadow_sr1 || econet_data->shadow_sr2)
+	{
+		sr1 = econet_data->shadow_sr1;
+		sr2 = econet_data->shadow_sr2;
+		econet_data->shadow_sr1 = econet_data->shadow_sr2 = 0;
+	}
+	else
 	{
 		sr1 = econet_read_sr(1);
-
 		sr2 = (sr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
+
+		if (!(sr1 & ECONET_GPIO_S1_IRQ))
+		{
+			sr1 = econet_read_sr(1);
+			sr2 = (sr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
+		}
 	}
 	
 	chip_state = econet_get_chipstate();
@@ -494,6 +542,9 @@ irqreturn_t econet_irq(int irq, void *ident)
 				ECONET_SET_BUSY();
 				/* reset packet pointer */
 				econet_data->rxp->ptr = 0;
+				/* Enable fast-path FIFO reads in the top half
+				 * for subsequent data bytes in this frame. */
+				atomic_set(&econet_data->fast_rx_enabled, 1);
 				/* Mark start of reception */
 				// econet_data->rxp->timing_start = ktime_get_ns();
 			}

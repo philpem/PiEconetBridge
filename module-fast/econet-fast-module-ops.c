@@ -157,6 +157,9 @@ int econet_init_vars (void)
 
         spin_lock_init(&econet_irq_spin);
 
+	/* Hybrid IRQ state */
+	atomic_set(&econet_data->fast_rx_enabled, 0);
+
 	/* Packet buffer init */
 
 	for (pbuf_count = 0; pbuf_count < ECONET_GPIO_MAX_BUFFERS; pbuf_count++)
