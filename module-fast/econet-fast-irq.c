@@ -428,9 +428,15 @@ irqreturn_t econet_irq(int irq, void *ident)
 
 	if (chip_state == EM_TEST)
 	{
-		printk (KERN_INFO "econet-fast: IRQ handler called in test mode!");
+		printk_ratelimited(KERN_INFO "econet-fast: IRQ handler called in test mode - disabling IRQ");
 		/* Turn off ADLC IRQs */
 		econet_write_cr(ECONET_GPIO_CR1, ECONET_GPIO_C1_TX_RESET | ECONET_GPIO_C1_RX_RESET);
+		/* Disable at the GIC too — if the ADLC doesn't de-assert
+		 * its IRQ line, level-triggered re-entry causes an IRQ storm
+		 * that saturates the GPIO bus and triggers a firmware reset.
+		 * Must use _nosync from within the handler itself. */
+		disable_irq_nosync(econet_data->irq);
+		econet_set_irq_state(0);
 	}
 	else if (chip_state == EM_FLAGFILL) /* IRQs are supposed to be off - let's make sure thye are */
 	{
@@ -549,6 +555,8 @@ irqreturn_t econet_irq(int irq, void *ident)
 					/* Shouldn't happen - switch off! */
 					printk (KERN_ERR "econet-fast: Unhandled chip mode %02X in IRQ handler, sr1 = 0x%02X, sr2 = 0x%02X. Disabling.\n", chip_state, sr1, sr2);
 					econet_write_cr(ECONET_GPIO_CR1, ECONET_GPIO_C1_TX_RESET | ECONET_GPIO_C1_RX_RESET);
+					disable_irq_nosync(econet_data->irq);
+					econet_set_irq_state(0);
 					econet_set_chipstate(EM_TEST);
 					ECONET_NOT_BUSY();
 					handled = 1;
@@ -557,11 +565,14 @@ irqreturn_t econet_irq(int irq, void *ident)
 		}
 		else
 		{
-			printk (KERN_ERR "econet-fast: No RX packet storage in IRQ handler! (rxp = %p)\n", econet_data->rxp);
+			printk (KERN_ERR "econet-fast: No RX packet storage in IRQ handler! (rxp = %p) - disabling IRQ\n", econet_data->rxp);
 
-			/* Turn the ADLC off! */
+			/* Turn the ADLC off and disable at the GIC to prevent
+			 * IRQ storm if the ADLC doesn't de-assert its line. */
 
 			econet_write_cr(ECONET_GPIO_CR1, ECONET_GPIO_C1_TX_RESET | ECONET_GPIO_C1_RX_RESET);
+			disable_irq_nosync(econet_data->irq);
+			econet_set_irq_state(0);
 			econet_set_chipstate(EM_TEST);
 			handled = 1;
 		}
