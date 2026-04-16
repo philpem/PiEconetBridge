@@ -432,11 +432,16 @@ irqreturn_t econet_irq_hardirq(int irq, void *ident)
 			hsr1 = econet_read_sr(1);
 			hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
 
-			/* Pure data byte: RDA set, no frame-end or error flags */
+			/* Pure data byte: RDA set, no frame-end or error flags,
+			 * and NOT a new-packet AP — AP must go through the thread
+			 * so it can set EM_READ, reset rxp->ptr, and mark busy.
+			 * Otherwise a new frame would accumulate on top of the
+			 * previous one's stale data. */
 			if ((hsr1 & ECONET_GPIO_S1_RDA)
 			    && !(hsr2 & (ECONET_GPIO_S2_VALID | ECONET_GPIO_S2_ERR
 			               | ECONET_GPIO_S2_OVERRUN | ECONET_GPIO_S2_DCD
-			               | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT))
+			               | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT
+			               | ECONET_GPIO_S2_AP))
 			    && econet_data->rxp
 			    && econet_data->rxp->ptr < ECONET_MAX_PACKET_SIZE)
 			{
