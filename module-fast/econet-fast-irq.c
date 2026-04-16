@@ -419,27 +419,42 @@ irqreturn_t econet_irq_hardirq(int irq, void *ident)
 	u8 hsr1, hsr2;
 
 	/* Fast path: if the thread told us we're mid-frame RX,
-	 * try to grab the data byte without waking the thread. */
+	 * try to grab data bytes without waking the thread.
+	 *
+	 * We loop to drain all available bytes — if another IRQ
+	 * handler delayed us by one byte period (~40µs), the ADLC
+	 * FIFO may have accumulated an extra byte. Reading in a
+	 * loop prevents overruns from brief scheduling delays. */
 	if (atomic_read(&econet_data->fast_rx_enabled))
 	{
-		hsr1 = econet_read_sr(1);
-		hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
-
-		/* Pure data byte: RDA set, no frame-end or error flags */
-		if ((hsr1 & ECONET_GPIO_S1_RDA)
-		    && !(hsr2 & (ECONET_GPIO_S2_VALID | ECONET_GPIO_S2_ERR
-		               | ECONET_GPIO_S2_OVERRUN | ECONET_GPIO_S2_DCD
-		               | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT))
-		    && econet_data->rxp
-		    && econet_data->rxp->ptr < ECONET_MAX_PACKET_SIZE)
+		for (;;)
 		{
-			econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
-			return IRQ_HANDLED; /* line unmasked, thread not woken */
-		}
+			hsr1 = econet_read_sr(1);
+			hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
 
-		/* Not a simple data byte — fall through to wake thread */
-		econet_data->shadow_sr1 = hsr1;
-		econet_data->shadow_sr2 = hsr2;
+			/* Pure data byte: RDA set, no frame-end or error flags */
+			if ((hsr1 & ECONET_GPIO_S1_RDA)
+			    && !(hsr2 & (ECONET_GPIO_S2_VALID | ECONET_GPIO_S2_ERR
+			               | ECONET_GPIO_S2_OVERRUN | ECONET_GPIO_S2_DCD
+			               | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT))
+			    && econet_data->rxp
+			    && econet_data->rxp->ptr < ECONET_MAX_PACKET_SIZE)
+			{
+				econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
+
+				/* Re-check: if no more IRQ pending, we're done */
+				if (!(econet_read_sr(1) & ECONET_GPIO_S1_IRQ))
+					return IRQ_HANDLED;
+
+				/* More data pending — loop and read it */
+				continue;
+			}
+
+			/* Not a simple data byte — fall through to wake thread */
+			econet_data->shadow_sr1 = hsr1;
+			econet_data->shadow_sr2 = hsr2;
+			break;
+		}
 	}
 
 	return IRQ_WAKE_THREAD;
