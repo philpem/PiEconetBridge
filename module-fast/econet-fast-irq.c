@@ -417,49 +417,95 @@ inline void econet_irq_write_new (u8 i_sr1, u8 i_sr2)
 irqreturn_t econet_irq_hardirq(int irq, void *ident)
 {
 	u8 hsr1, hsr2;
+	u8 error_mask = ECONET_GPIO_S2_VALID | ECONET_GPIO_S2_ERR
+	              | ECONET_GPIO_S2_OVERRUN | ECONET_GPIO_S2_DCD
+	              | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT;
 
-	/* Fast path: if the thread told us we're mid-frame RX,
-	 * try to grab data bytes without waking the thread.
-	 *
-	 * We loop to drain all available bytes — if another IRQ
-	 * handler delayed us by one byte period (~40µs), the ADLC
-	 * FIFO may have accumulated an extra byte. Reading in a
-	 * loop prevents overruns from brief scheduling delays. */
-	if (atomic_read(&econet_data->fast_rx_enabled))
+	hsr1 = econet_read_sr(1);
+	hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
+
+	/* AP fast path: new frame starting. Short frames (4-byte ACKs
+	 * in particular) can be entirely consumed before the thread
+	 * would have scheduled. Handle AP + first byte in hard-IRQ
+	 * to eliminate the ~50µs thread wake-up delay. */
+	if ((hsr2 & ECONET_GPIO_S2_AP)
+	    && (hsr1 & ECONET_GPIO_S1_RDA)
+	    && !(hsr2 & error_mask)
+	    && econet_data->rxp
+	    && !atomic_read(&econet_data->fast_rx_enabled))
 	{
+		econet_set_chipstate(EM_READ);
+		ECONET_SET_BUSY();
+		econet_data->rxp->ptr = 0;
+		econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
+		atomic_set(&econet_data->fast_rx_enabled, 1);
+
+		/* Drain any further bytes already in the FIFO.
+		 * Re-read SRs each iteration; loop exits on any
+		 * error/frame-end flag or when RDA clears. */
 		for (;;)
 		{
 			hsr1 = econet_read_sr(1);
 			hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
 
+			if (hsr2 & error_mask)
+			{
+				/* Error or frame valid — let the thread handle it */
+				econet_data->shadow_sr1 = hsr1;
+				econet_data->shadow_sr2 = hsr2;
+				return IRQ_WAKE_THREAD;
+			}
+
+			if (!(hsr1 & ECONET_GPIO_S1_RDA))
+				return IRQ_HANDLED;
+
+			if (econet_data->rxp->ptr >= ECONET_MAX_PACKET_SIZE)
+				return IRQ_WAKE_THREAD;
+
+			econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
+		}
+	}
+
+	/* Mid-frame data byte fast path: the thread told us we're in
+	 * EM_READ, drain all available bytes. Loop to catch bytes that
+	 * accumulated during any brief scheduling delay. */
+	if (atomic_read(&econet_data->fast_rx_enabled))
+	{
+		for (;;)
+		{
 			/* Pure data byte: RDA set, no frame-end or error flags,
-			 * and NOT a new-packet AP — AP must go through the thread
-			 * so it can set EM_READ, reset rxp->ptr, and mark busy.
-			 * Otherwise a new frame would accumulate on top of the
-			 * previous one's stale data. */
+			 * and NOT a new-packet AP (AP mid-frame means the chip
+			 * restarted framing — needs thread handling). */
 			if ((hsr1 & ECONET_GPIO_S1_RDA)
-			    && !(hsr2 & (ECONET_GPIO_S2_VALID | ECONET_GPIO_S2_ERR
-			               | ECONET_GPIO_S2_OVERRUN | ECONET_GPIO_S2_DCD
-			               | ECONET_GPIO_S2_RX_IDLE | ECONET_GPIO_S2_RX_ABORT
-			               | ECONET_GPIO_S2_AP))
+			    && !(hsr2 & (error_mask | ECONET_GPIO_S2_AP))
 			    && econet_data->rxp
 			    && econet_data->rxp->ptr < ECONET_MAX_PACKET_SIZE)
 			{
 				econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
 
-				/* Re-check: if no more IRQ pending, we're done */
-				if (!(econet_read_sr(1) & ECONET_GPIO_S1_IRQ))
+				/* Re-read for next iteration */
+				hsr1 = econet_read_sr(1);
+				hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
+
+				/* No more IRQ pending — we're done */
+				if (!(hsr1 & ECONET_GPIO_S1_IRQ))
 					return IRQ_HANDLED;
 
-				/* More data pending — loop and read it */
 				continue;
 			}
 
-			/* Not a simple data byte — fall through to wake thread */
+			/* Not a simple data byte — shadow and wake thread */
 			econet_data->shadow_sr1 = hsr1;
 			econet_data->shadow_sr2 = hsr2;
 			break;
 		}
+	}
+	else
+	{
+		/* Not in active RX — still need to wake thread but
+		 * shadow the SRs we already read so it doesn't re-read */
+		econet_data->shadow_sr1 = hsr1;
+		econet_data->shadow_sr2 = hsr2;
 	}
 
 	return IRQ_WAKE_THREAD;
