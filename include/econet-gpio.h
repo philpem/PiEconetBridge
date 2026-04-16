@@ -223,6 +223,7 @@ extern void econet_free_workbuf(eco_work_t *);
 unsigned char econet_read_sr(unsigned short);
 
 /* IRQ */
+irqreturn_t econet_irq_hardirq(int, void *);
 irqreturn_t econet_irq(int, void *);
 void econet_irq_mode(short);
 

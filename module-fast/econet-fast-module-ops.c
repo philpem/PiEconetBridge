@@ -692,11 +692,14 @@ int econet_probe (struct platform_device *pdev)
 
 	if (
 			(econet_data->irq < 0) /* Didn't get IRQ */
-		|| (	(err = request_irq(econet_data->irq, econet_irq, 
-					((econet_data->hwver < 2) ? 
+		|| (	(err = request_threaded_irq(econet_data->irq,
+					econet_irq_hardirq,  /* top half: just wakes thread */
+					econet_irq,          /* thread fn: ADLC state machine */
+					((econet_data->hwver < 2) ?
 					 IRQF_TRIGGER_LOW :  /* /IRQ on v1 boards */
-					 IRQF_TRIGGER_HIGH), /* IRQ high = interrupt on v2 baords */
-					THIS_MODULE->name, 
+					 IRQF_TRIGGER_HIGH)  /* IRQ high = interrupt on v2 boards */
+					| IRQF_ONESHOT,      /* keep IRQ masked until thread returns */
+					THIS_MODULE->name,
 					THIS_MODULE->name)) != 0
 		   )
 	   )

@@ -396,20 +396,31 @@ inline void econet_irq_write_new (u8 i_sr1, u8 i_sr2)
 	return;
 }
 
+/* econet_irq_hardirq()
+ *
+ * Minimal hard-IRQ top half — just wakes the threaded handler.
+ * With IRQF_ONESHOT the GIC keeps the line masked until the
+ * thread function returns, preventing re-entry.
+ */
+
+irqreturn_t econet_irq_hardirq(int irq, void *ident)
+{
+	return IRQ_WAKE_THREAD;
+}
+
 /* econet_irq()
  *
- * New faster IRQ handler
+ * Threaded IRQ handler (runs as a kthread with IRQs enabled).
  */
 
 irqreturn_t econet_irq(int irq, void *ident)
 {
 
-	unsigned long 	flags;
 	u8		chip_state, handled = 0;
 
-	/* Prevent re-entry */
+	/* Serialise against econet_writefd */
 
-	spin_lock_irqsave(&econet_irq_spin, flags);
+	spin_lock(&econet_irq_spin);
 
 	/* Read SR1 only, for speed. SR2 read below if need be */
 
@@ -648,7 +659,7 @@ irqreturn_t econet_irq(int irq, void *ident)
 	 *
 	 */
 
-	spin_unlock_irqrestore(&econet_irq_spin, flags);
+	spin_unlock(&econet_irq_spin);
 
 	/* Return */
 
