@@ -456,8 +456,11 @@ irqreturn_t econet_irq_hardirq(int irq, void *ident)
 		econet_data->rxp->ptr = 0;
 
 		atomic_set(&(econet_data->fastpath_enabled), 1);
+		fastpath = 1;
 
 		econet_set_chipstate(EM_READ);
+		chipstate = EM_READ;
+		ECONET_SET_BUSY();
 
 		econet_data->rxp->data[econet_data->rxp->ptr++] = econet_read_fifo();
 
@@ -511,8 +514,13 @@ irqreturn_t econet_irq_hardirq(int irq, void *ident)
 					econet_data->shadow_sr2 = hsr2;
 					return IRQ_WAKE_THREAD;
 				}
-	
-				/* Don't need hsr1 for second byte on 2 byte transfer hsr1 = econet_read_sr(1); */
+
+				/*
+				 * Re-read SR1 between FIFO reads. In 2-byte mode the second
+				 * byte must be gated by the current RDA state, not the stale
+				 * value from the first byte.
+				 */
+				hsr1 = econet_read_sr(1);
 				hsr2 = (hsr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
 			}
 
@@ -558,14 +566,9 @@ irqreturn_t econet_irq_hardirq(int irq, void *ident)
 
 			if ((hsr1 & (ECONET_GPIO_S1_IRQ | ECONET_GPIO_S1_TDRA)) != (ECONET_GPIO_S1_IRQ | ECONET_GPIO_S1_TDRA)) /* No IRQ or no TDRA */
 			{
-				return IRQ_HANDLED; /* Surely this is what we need to be doing?? */
-#if 0
-				printk_ratelimited ("econet-fast: Either no IRQ or no TDRA on fastpath tx: SR1 = %02X\n", hsr1);
 				econet_data->shadow_sr1 = hsr1;
 				econet_data->shadow_sr2 = hsr2;
 				return IRQ_WAKE_THREAD;
-#endif
-
 			}
 
 			while (bytes_to_do--)
@@ -611,21 +614,6 @@ irqreturn_t econet_irq_hardirq(int irq, void *ident)
 					{
 						econet_data->shadow_sr2 = (econet_data->shadow_sr1 & ECONET_GPIO_S1_S2RQ) ? econet_read_sr(2) : 0;
 						printk_ratelimited(KERN_INFO "econet-fast: IRQ on fastpath write of last byte: FC is %d, SR1 = %02X, SR2 = %02X\n", !!(econet_data->shadow_sr1 & ECONET_GPIO_S1_TDRA), econet_data->shadow_sr1, econet_data->shadow_sr2);
-
-						/* Should have FC set - if not, clear TX status */
-
-						if (!(econet_data->shadow_sr1 & ECONET_GPIO_S1_TDRA))
-						{
-							econet_write_cr(2,
-								(ECONET_GPIO_C2_PSE |
-								 ECONET_GPIO_C2_FLAGIDLE |
-								 ECONET_GPIO_C2_CLR_RX_STATUS |
-								 ECONET_GPIO_C2_CLR_TX_STATUS |
-								 ((econet_data->twobytemode) ? ECONET_GPIO_C2_2BYTES : 0)
-								));
-							return IRQ_HANDLED;
-						}
-
 						return IRQ_WAKE_THREAD;
 					}
 					else
